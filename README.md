@@ -1,2 +1,6 @@
 # igsmj2tool
-The hobby experience to messing around with classic majong game.
+
+igsmj2_extractor.py Sprite and Sound extractor
+Bugs: The extractor can't find multiple palettes.
+
+igsmj2_keygen.html Well, the Keygen of course.
