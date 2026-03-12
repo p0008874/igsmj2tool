@@ -8,7 +8,7 @@ Bugs: The extractor can't find multiple palettes.
 igsmj2_keygen.html Well, the Keygen of course.
 
 
-MJ2013/update.rom
+MJ2013/update.rom (For the 2013 version released in China.)
 ```
 At 0x41896c: je 0x418ca0 — if update.rom [FLAG] name=gt365.com, it jumps PAST all serial validation straight to the clean exit. That's the hardcoded bypass string.
 Place update.rom in the same directory as MJ2013.exe. That's it — no serial, no exe patch.
