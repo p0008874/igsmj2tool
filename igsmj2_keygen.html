@@ -204,7 +204,7 @@ function generateSerial() {
         const ms = (performance.now() - t0).toFixed(1);
         currentSerial = s;
         document.getElementById('serial-display').value = s;
-        addLog(`<span class="ok">Generated [${attempt+1} att, ${ms}ms]: ${s}</span>`);
+        addLog(`<span class="ok">Generated[${attempt+1} att, ${ms}ms]: ${s}</span>`);
         document.getElementById('status').textContent = 'Ready.';
         return s;
       }
@@ -237,16 +237,10 @@ function addLog(html) {
   logPanel.scrollTop = logPanel.scrollHeight;
 }
 
-// Self-test on load
-const v1 = isValid('711S9D31'), v2 = isValid('AG3K1859');
-addLog(`Self-test 711S9D31: <span class="${v1?'ok':'warn'}">${v1?'OK':'FAIL'}</span>`);
-addLog(`Self-test AG3K1859: <span class="${v2?'ok':'warn'}">${v2?'OK':'FAIL'}</span>`);
-document.getElementById('status').textContent = v1 && v2 ? 'Algorithm verified. Generating...' : 'Self-test failed!';
-
-// Auto-generate initial key if tests passed
-if (v1 && v2) {
-  setTimeout(generateSerial, 100);
-}
+// Initialize UI to READY state
+document.getElementById('status').textContent = 'Ready.';
+document.getElementById('serial-display').value = 'PRESS GENERATE';
+addLog('<span class="ok">System initialized and ready.</span>');
 </script>
 </body>
 </html>
