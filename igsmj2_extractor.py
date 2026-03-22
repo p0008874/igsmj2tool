@@ -161,25 +161,55 @@ def indexed_to_png(pixels: bytes, width: int, height: int,
     img.save(out_path)
 
 
-def rgb555_to_png(pixels: bytes, width: int, height: int, out_path: str,
-                  has_alpha: bool = False):
+def tga_abgr4444_to_png(pixels: bytes, width: int, height: int, out_path: str):
     """
-    Convert 16-bit RGB555 or ARGB1555 pixel data to PNG.
-    Format: bit15=alpha(if has_alpha), bits14-10=R, bits9-5=G, bits4-0=B
-    Each channel 5 bits → scale to 8 bits by: val * 255 // 31
+    Decode TGA_LZSS pixels (ABGR4444) to PNG.
+
+    Confirmed from EXE blit inner loop at 0x40f39c:
+    Each 16-bit pixel is four 4-bit nibbles:
+      bits 15:12 = Alpha (4-bit, 0 = transparent, 15 = fully opaque)
+      bits 11:8  = Blue  (4-bit)
+      bits  7:4  = Green (4-bit)
+      bits  3:0  = Red   (4-bit)
+
+    alpha == 0 → fully transparent (PNG alpha = 0).
+    Each 4-bit channel scaled to 8-bit: val * 17 (= val * 255 // 15).
     """
-    img = _PILImage.new('RGBA' if has_alpha else 'RGB', (width, height))
+    img = _PILImage.new('RGBA', (width, height))
+    pixel_list = []
+    for i in range(0, len(pixels) - 1, 2):
+        val = pixels[i] | (pixels[i + 1] << 8)
+        a4 = (val >> 12) & 0xF
+        b4 = (val >>  8) & 0xF
+        g4 = (val >>  4) & 0xF
+        r4 =  val        & 0xF
+        a8 = 0 if a4 == 0 else a4 * 17
+        pixel_list.append((r4 * 17, g4 * 17, b4 * 17, a8))
+    img.putdata(pixel_list)
+    img.save(out_path)
+
+
+def rgb555_to_png(pixels: bytes, width: int, height: int, out_path: str):
+    """
+    Decode BMP_LZSS pixels (RGB555) to PNG.
+
+    BMP_LZSS chunks store raw 16-bit RGB555 background frames:
+      bits 14:10 = Red   (5-bit)
+      bits  9:5  = Green (5-bit)
+      bits  4:0  = Blue  (5-bit)
+      bit  15    = unused (always 0 for BMP)
+
+    No transparency — all pixels fully opaque.
+    Each 5-bit channel scaled to 8-bit: val * 255 // 31.
+    """
+    img = _PILImage.new('RGB', (width, height))
     pixel_list = []
     for i in range(0, len(pixels) - 1, 2):
         val = pixels[i] | (pixels[i + 1] << 8)
         r = ((val >> 10) & 0x1F) * 255 // 31
-        g = ((val >> 5) & 0x1F) * 255 // 31
-        b = (val & 0x1F) * 255 // 31
-        if has_alpha:
-            a = 255 if (val & 0x8000) else 0
-            pixel_list.append((r, g, b, a))
-        else:
-            pixel_list.append((r, g, b))
+        g = ((val >>  5) & 0x1F) * 255 // 31
+        b = ( val        & 0x1F) * 255 // 31
+        pixel_list.append((r, g, b))
     img.putdata(pixel_list)
     img.save(out_path)
 
@@ -272,6 +302,132 @@ def parse_chunks(data: bytes) -> list:
     return chunks
 
 
+# ─── Sprite Palette Map ───────────────────────────────────────────────────────
+
+def build_sprite_palette_map(chunks: list) -> dict:
+    """
+    Build a mapping of {global_sprite_idx: palette_idx} by walking ACT metadata.
+
+    The global_sprite_idx is the sequential position of a sprite chunk across ALL
+    sprite types (PCX_LZSS, TGA_LZSS, BMP_LZSS, PK0_LZSS) in file order — exactly
+    matching the index stored in ACT_POOL at uint16 offset 6.
+
+    ACT_STEP layout (10 bytes per sub-step; larger chunks are multiple sub-steps):
+      b0 = opcode: 0 = frame step (draws a sprite), non-zero = control step
+      b3 = frame offset from ACT_POOL base sprite index
+      b5 = palette index (low 5 bits; upper 3 bits are flags per EXE at 0x40217b)
+
+    Assignment priority: **lowest b3 wins**. A direct hit (b3=0, sprite == pool_base)
+    takes priority over a large-b3 incidental hit from a slideshow/gallery animation
+    (e.g. title.rom ACT#3: pool_base=1, b3=72 → sprite 73 with pal 2, overridden
+    by ACT#7: pool_base=73, b3=0 → sprite 73 with pal 3).
+
+    Multi-pool Pattern B (who.rom, title.rom): steps appear BEFORE the first pool,
+    then many sequential POOL+ACTBLOCK pairs share those steps. Detected by finding
+    a POOL with no new ACT_STEP since the last flush; applies last_dominant palette.
+
+    Fallback pass: sprites within a pool's range but not in any frame step
+    (e.g. skipped b3 offsets) inherit the animation's dominant non-zero palette,
+    again respecting the min-b3 priority.
+    """
+    # Store (palette, b3, distinct_b3) per sprite.
+    # Priority: lower b3 wins (direct hit > indirect); ties broken by higher distinct_b3
+    # (animation covering more sprites is more "complete" and more likely to be primary).
+    sprite_best: dict = {}   # global_sprite_idx → (palette, b3, distinct_b3)
+    act_pool_ranges: list = []
+
+    chunk_list = list(chunks)
+
+    def _assign(si, pal, b3, distinct_b3=1):
+        """Assign palette: min b3 wins; ties broken by max distinct_b3."""
+        prev = sprite_best.get(si)
+        if prev is None:
+            sprite_best[si] = (pal, b3, distinct_b3)
+        elif b3 < prev[1]:
+            sprite_best[si] = (pal, b3, distinct_b3)
+        elif b3 == prev[1] and distinct_b3 > prev[2]:
+            sprite_best[si] = (pal, b3, distinct_b3)
+
+    def _flush_frames(base, frames):
+        if base < 0 or not frames:
+            return 0
+        distinct_b3 = len(set(b3 for b3, _ in frames))
+        for b3, b5 in frames:
+            _assign(base + b3, b5, b3, distinct_b3)
+        from collections import Counter
+        pal_counts = Counter(b5 for _, b5 in frames if b5 != 0)
+        dominant = pal_counts.most_common(1)[0][0] if pal_counts else 0
+        max_b3 = max(b3 for b3, _ in frames)
+        act_pool_ranges.append((base, base + max_b3, dominant))
+        return dominant
+
+    in_act = False
+    cur_frames = []
+    cur_base = -1
+    last_dominant = 0
+
+    i = 0
+    while i < len(chunk_list):
+        name, _offset, cd = chunk_list[i]
+
+        if name == 'ACT_DATA':
+            _flush_frames(cur_base, cur_frames)
+            cur_frames = []
+            cur_base = -1
+            last_dominant = 0
+            in_act = True
+
+        elif name == 'ACTBLOCK' and in_act:
+            dom = _flush_frames(cur_base, cur_frames)
+            if dom:
+                last_dominant = dom
+            cur_frames = []  # reset after each flush (Pattern A default)
+
+        elif in_act:
+            if name == 'ACT_STEP':
+                n_sub = len(cd) // 10
+                for s in range(n_sub):
+                    b0 = cd[s * 10 + 0]
+                    if b0 == 0:
+                        b3 = cd[s * 10 + 3]
+                        b5 = cd[s * 10 + 5] & 0x1F
+                        cur_frames.append((b3, b5))
+
+            elif name == 'ACT_POOL' and len(cd) >= 8:
+                new_base = struct.unpack_from('<H', cd, 6)[0]
+                if cur_frames:
+                    # Has steps — will flush at next ACTBLOCK (Pattern A)
+                    cur_base = new_base
+                else:
+                    # No steps since last flush — Pattern B: inherit dominant palette.
+                    # Use b3=500 so any real step assignment (b3 < 500) takes priority.
+                    if last_dominant != 0:
+                        _assign(new_base, last_dominant, 500, 1)
+                        act_pool_ranges.append((new_base, new_base, last_dominant))
+                    cur_base = new_base
+
+        i += 1
+
+    _flush_frames(cur_base, cur_frames)
+
+    # Fallback: fill b3-skipped sprites with dominant palette, respecting min-b3 rule.
+    # Use a large b3 value (1000) so any real assignment takes priority.
+    # Only fill sprites that have NO assignment at all — never overwrite an explicit
+    # pal=0 assignment (e.g. title.rom ACT#5 deliberately assigns sprite 72 pal=0).
+    for base, end, dominant in act_pool_ranges:
+        if dominant == 0:
+            continue
+        for si in range(base, end + 1):
+            if sprite_best.get(si) is None:
+                _assign(si, dominant, 1000, 1)
+
+    # Extract just the palette values
+    return {si: pal for si, (pal, _, _d) in sprite_best.items()}
+
+
+
+
+
 # ─── IGSROM01 Extractor ───────────────────────────────────────────────────────
 
 def extract_igsrom01(data: bytes, out_dir: str, base_name: str) -> dict:
@@ -332,6 +488,7 @@ def extract_pcdata01(data: bytes, out_dir: str, base_name: str) -> dict:
     act_idx = 0
     step_idx = 0
     pool_idx = 0
+    global_sprite_idx = 0   # sequential index across ALL sprite types (matches ACT_POOL offset-6)
 
     # First pass: collect all palettes
     for name, data_offset, chunk_data in chunks:
@@ -347,6 +504,11 @@ def extract_pcdata01(data: bytes, out_dir: str, base_name: str) -> dict:
         with open(pal_path, 'wb') as f:
             for r, g, b in pal:
                 f.write(bytes([r, g, b]))
+
+    # Build global-sprite-index → palette-index map from ACT metadata.
+    # TGA/BMP sprites never use this (16-bit), but their global indices are
+    # counted so that PCX/PK0 indices stay in sync with ACT_POOL references.
+    sprite_pal_map = build_sprite_palette_map(chunks)
 
     # Second pass: process all other chunks
     for name, data_offset, chunk_data in chunks:
@@ -368,14 +530,18 @@ def extract_pcdata01(data: bytes, out_dir: str, base_name: str) -> dict:
                 expected = w * h
                 if len(pixels) >= expected:
                     pixels = pixels[:expected]
+                pal_idx = sprite_pal_map.get(global_sprite_idx, 0)
+                palette = palettes[pal_idx] if pal_idx < len(palettes) else default_palette
                 out_path = os.path.join(out_dir, f'{base_name}_pcx_{pcx_idx:04d}_{w}x{h}.png')
-                indexed_to_png(pixels, w, h, default_palette, out_path)
+                indexed_to_png(pixels, w, h, palette, out_path)
                 pcx_images.append({
-                    'index': pcx_idx, 'width': w, 'height': h,
+                    'index': pcx_idx, 'global_index': global_sprite_idx,
+                    'palette_index': pal_idx, 'width': w, 'height': h,
                     'compressed_size': len(chunk_data), 'decompressed_size': len(pixels),
                     'file': out_path
                 })
             pcx_idx += 1
+            global_sprite_idx += 1
 
         elif name == 'TGA_LZSS' and len(chunk_data) >= 4:
             w = struct.unpack_from('<H', chunk_data, 0)[0]
@@ -386,13 +552,15 @@ def extract_pcdata01(data: bytes, out_dir: str, base_name: str) -> dict:
                 if len(pixels) >= expected:
                     pixels = pixels[:expected]
                 out_path = os.path.join(out_dir, f'{base_name}_tga_{tga_idx:04d}_{w}x{h}.png')
-                rgb555_to_png(pixels, w, h, out_path, has_alpha=True)
+                tga_abgr4444_to_png(pixels, w, h, out_path)
                 tga_images.append({
-                    'index': tga_idx, 'width': w, 'height': h,
+                    'index': tga_idx, 'global_index': global_sprite_idx,
+                    'width': w, 'height': h,
                     'compressed_size': len(chunk_data), 'decompressed_size': len(pixels),
                     'file': out_path
                 })
             tga_idx += 1
+            global_sprite_idx += 1  # TGA is 16-bit, no palette, but must count for index sync
 
         elif name == 'BMP_LZSS' and len(chunk_data) >= 4:
             w = struct.unpack_from('<H', chunk_data, 0)[0]
@@ -403,28 +571,34 @@ def extract_pcdata01(data: bytes, out_dir: str, base_name: str) -> dict:
                 if len(pixels) >= expected:
                     pixels = pixels[:expected]
                 out_path = os.path.join(out_dir, f'{base_name}_bmp_{bmp_idx:04d}_{w}x{h}.png')
-                rgb555_to_png(pixels, w, h, out_path, has_alpha=False)
+                rgb555_to_png(pixels, w, h, out_path)
                 bmp_images.append({
-                    'index': bmp_idx, 'width': w, 'height': h,
+                    'index': bmp_idx, 'global_index': global_sprite_idx,
+                    'width': w, 'height': h,
                     'compressed_size': len(chunk_data), 'decompressed_size': len(pixels),
                     'file': out_path
                 })
             bmp_idx += 1
+            global_sprite_idx += 1  # BMP is 16-bit, no palette, but must count for index sync
 
         elif name == 'PK0_LZSS' and len(chunk_data) >= 8:
             w = struct.unpack_from('<H', chunk_data, 0)[0]
             h = struct.unpack_from('<H', chunk_data, 2)[0]
             decomp_size = struct.unpack_from('<I', chunk_data, 4)[0]
             if w > 0 and h > 0:
+                pal_idx = sprite_pal_map.get(global_sprite_idx, 0)
+                palette = palettes[pal_idx] if pal_idx < len(palettes) else default_palette
                 out_path = os.path.join(out_dir, f'{base_name}_pk0_{pk0_idx:04d}_{w}x{h}.png')
-                pk0_lzss_to_png(chunk_data, default_palette, out_path)
+                pk0_lzss_to_png(chunk_data, palette, out_path)
                 pk0_images.append({
-                    'index': pk0_idx, 'width': w, 'height': h,
+                    'index': pk0_idx, 'global_index': global_sprite_idx,
+                    'palette_index': pal_idx, 'width': w, 'height': h,
                     'compressed_size': len(chunk_data),
                     'decompressed_size': decomp_size,
                     'file': out_path
                 })
             pk0_idx += 1
+            global_sprite_idx += 1
 
         elif name == 'ACT_DATA' and len(chunk_data) == 44:
             act_info = {
@@ -465,6 +639,10 @@ def extract_pcdata01(data: bytes, out_dir: str, base_name: str) -> dict:
         'bmp_background_count': len(bmp_images),
         'pk0_sprite_count': len(pk0_images),
         'animation_count': len(act_data_list),
+        'pcx_sprites': pcx_images,
+        'tga_sprites': tga_images,
+        'bmp_sprites': bmp_images,
+        'pk0_sprites': pk0_images,
         'animations': act_data_list,
         'steps': act_steps,
         'pools': act_pools,
