@@ -56,6 +56,7 @@ Examples:
 import os
 import sys
 import struct
+from collections import Counter
 from pathlib import Path
 
 try:
@@ -312,34 +313,71 @@ def build_sprite_palette_map(chunks: list) -> dict:
     sprite types (PCX_LZSS, TGA_LZSS, BMP_LZSS, PK0_LZSS) in file order — exactly
     matching the index stored in ACT_POOL at uint16 offset 6.
 
-    ACT_STEP layout (10 bytes per sub-step; larger chunks are multiple sub-steps):
-      b0 = opcode: 0 = frame step (draws a sprite), non-zero = control step
-      b3 = frame offset from ACT_POOL base sprite index
-      b5 = palette index (low 5 bits; upper 3 bits are flags per EXE at 0x40217b)
+    ACT_STEP layout (10 bytes per sub-step):
+      b0 = opcode: 0 = draw step, 6 = multi-pool count step, others = control
+      b3 = interpretation depends on ACT type (see below)
+      b5 = palette index (low 5 bits; confirmed by EXE disasm at 0x40217b: and edx,0x1f)
 
-    Assignment priority: **lowest b3 wins**. A direct hit (b3=0, sprite == pool_base)
-    takes priority over a large-b3 incidental hit from a slideshow/gallery animation
-    (e.g. title.rom ACT#3: pool_base=1, b3=72 → sprite 73 with pal 2, overridden
-    by ACT#7: pool_base=73, b3=0 → sprite 73 with pal 3).
+    Two ACT patterns, distinguished by the presence of a b0=6 "count" step:
 
-    Multi-pool Pattern B (who.rom, title.rom): steps appear BEFORE the first pool,
-    then many sequential POOL+ACTBLOCK pairs share those steps. Detected by finding
-    a POOL with no new ACT_STEP since the last flush; applies last_dominant palette.
+    POOL-INDEX MODE (b0=6 present): Multi-character animation where each ACT_POOL
+      is one character slot. b3 = pool slot index; gi = pools[b3].base. The b0=6
+      step stores the sprite count in state+0x54 (EXE at 0x4020d6). Pools are often
+      non-consecutive (e.g. jeff.rom ACT#16: pools=[5,28,29,30,9,10,11,1]).
+      Pool-index assignments are authoritative and override all other assignments.
 
-    Fallback pass: sprites within a pool's range but not in any frame step
-    (e.g. skipped b3 offsets) inherit the animation's dominant non-zero palette,
-    again respecting the min-b3 priority.
+    TRADITIONAL MODE (no b0=6): b3 = sprite offset from pool base; gi = pool_base+b3.
+      Assignment priority: lowest b3 wins (direct hit > indirect). Tiebreak: higher
+      distinct-b3 count (more complete animation). Pattern B: steps before pool with
+      no intervening ACT_STEP -> inherit last dominant palette at b3=500 priority.
+      Fallback: unassigned sprites in pool range inherit dominant palette at b3=1000.
     """
-    # Store (palette, b3, distinct_b3) per sprite.
-    # Priority: lower b3 wins (direct hit > indirect); ties broken by higher distinct_b3
-    # (animation covering more sprites is more "complete" and more likely to be primary).
-    sprite_best: dict = {}   # global_sprite_idx → (palette, b3, distinct_b3)
-    act_pool_ranges: list = []
-
     chunk_list = list(chunks)
 
+    # -- Pass 1: collect full ACT structures (all steps + all pool bases per ACT) --
+    act_structs: list = []   # list of (step_bytes_list, pool_bases_list)
+    _cs: list = []
+    _cp: list = []
+    for name, _, cd in chunk_list:
+        if name == 'ACT_DATA':
+            if _cs or _cp:
+                act_structs.append((_cs[:], _cp[:]))
+            _cs = []; _cp = []
+        elif name == 'ACT_STEP':
+            for s in range(len(cd) // 10):
+                _cs.append(cd[s * 10: s * 10 + 10])
+        elif name == 'ACT_POOL' and len(cd) >= 8:
+            _cp.append(struct.unpack_from('<H', cd, 6)[0])
+    if _cs or _cp:
+        act_structs.append((_cs, _cp))
+
+    # -- Pass 2: pool-index mode assignments (authoritative) ----------------------
+    # ACTs containing a b0=6 step use b3 as a pool slot index: gi = pools[b3].base.
+    # Collect votes; most-common non-zero palette per gi wins.
+    b06_votes: dict = {}     # gi -> Counter
+    for steps, pools in act_structs:
+        if not any(s[0] == 6 for s in steps):
+            continue
+        for step in steps:
+            if step[0] == 0:                      # draw step
+                b3 = step[3]
+                b5 = step[5] & 0x1F
+                if b3 < len(pools) and b5 != 0:
+                    gi = pools[b3]
+                    if gi not in b06_votes:
+                        b06_votes[gi] = Counter()
+                    b06_votes[gi][b5] += 1
+    b06_assignments: dict = {gi: v.most_common(1)[0][0]
+                              for gi, v in b06_votes.items()}
+
+    # -- Pass 3: traditional mode (existing min-b3 algorithm) ---------------------
+    # Processes non-b0=6 ACTs; sprites owned by b06_assignments are protected.
+    sprite_best: dict = {}   # gi -> (palette, b3, distinct_b3)
+    act_pool_ranges: list = []
+
     def _assign(si, pal, b3, distinct_b3=1):
-        """Assign palette: min b3 wins; ties broken by max distinct_b3."""
+        if si in b06_assignments:          # pool-index mode owns this sprite
+            return
         prev = sprite_best.get(si)
         if prev is None:
             sprite_best[si] = (pal, b3, distinct_b3)
@@ -354,7 +392,6 @@ def build_sprite_palette_map(chunks: list) -> dict:
         distinct_b3 = len(set(b3 for b3, _ in frames))
         for b3, b5 in frames:
             _assign(base + b3, b5, b3, distinct_b3)
-        from collections import Counter
         pal_counts = Counter(b5 for _, b5 in frames if b5 != 0)
         dominant = pal_counts.most_common(1)[0][0] if pal_counts else 0
         max_b3 = max(b3 for b3, _ in frames)
@@ -362,33 +399,26 @@ def build_sprite_palette_map(chunks: list) -> dict:
         return dominant
 
     in_act = False
-    cur_frames = []
+    cur_frames: list = []
     cur_base = -1
     last_dominant = 0
 
-    i = 0
-    while i < len(chunk_list):
-        name, _offset, cd = chunk_list[i]
-
+    for name, _offset, cd in chunk_list:
         if name == 'ACT_DATA':
             _flush_frames(cur_base, cur_frames)
-            cur_frames = []
-            cur_base = -1
-            last_dominant = 0
+            cur_frames = []; cur_base = -1; last_dominant = 0
             in_act = True
 
         elif name == 'ACTBLOCK' and in_act:
             dom = _flush_frames(cur_base, cur_frames)
             if dom:
                 last_dominant = dom
-            cur_frames = []  # reset after each flush (Pattern A default)
+            cur_frames = []
 
         elif in_act:
             if name == 'ACT_STEP':
-                n_sub = len(cd) // 10
-                for s in range(n_sub):
-                    b0 = cd[s * 10 + 0]
-                    if b0 == 0:
+                for s in range(len(cd) // 10):
+                    if cd[s * 10] == 0:           # draw step only
                         b3 = cd[s * 10 + 3]
                         b5 = cd[s * 10 + 5] & 0x1F
                         cur_frames.append((b3, b5))
@@ -396,39 +426,30 @@ def build_sprite_palette_map(chunks: list) -> dict:
             elif name == 'ACT_POOL' and len(cd) >= 8:
                 new_base = struct.unpack_from('<H', cd, 6)[0]
                 if cur_frames:
-                    # Has steps — will flush at next ACTBLOCK (Pattern A)
-                    cur_base = new_base
+                    cur_base = new_base           # Pattern A: flush at ACTBLOCK
                 else:
-                    # No steps since last flush — Pattern B: inherit dominant palette.
-                    # Use b3=500 so any real step assignment (b3 < 500) takes priority.
+                    # Pattern B: no new steps -> inherit dominant palette
                     if last_dominant != 0:
                         _assign(new_base, last_dominant, 500, 1)
                         act_pool_ranges.append((new_base, new_base, last_dominant))
                     cur_base = new_base
 
-        i += 1
-
     _flush_frames(cur_base, cur_frames)
 
-    # Fallback: fill b3-skipped sprites with dominant palette, respecting min-b3 rule.
-    # Use a large b3 value (1000) so any real assignment takes priority.
-    # Only fill sprites that have NO assignment at all — never overwrite an explicit
-    # pal=0 assignment (e.g. title.rom ACT#5 deliberately assigns sprite 72 pal=0).
+    # Fallback: fill unassigned sprites in pool ranges with dominant palette.
     for base, end, dominant in act_pool_ranges:
         if dominant == 0:
             continue
         for si in range(base, end + 1):
-            if sprite_best.get(si) is None:
+            if sprite_best.get(si) is None and si not in b06_assignments:
                 _assign(si, dominant, 1000, 1)
 
-    # Extract just the palette values
-    return {si: pal for si, (pal, _, _d) in sprite_best.items()}
+    # Merge: pool-index assignments override traditional
+    result = {si: pal for si, (pal, _, _d) in sprite_best.items()}
+    result.update(b06_assignments)
+    return result
 
 
-
-
-
-# ─── IGSROM01 Extractor ───────────────────────────────────────────────────────
 
 def extract_igsrom01(data: bytes, out_dir: str, base_name: str) -> dict:
     """
