@@ -19,7 +19,7 @@ LZSS Compression (used in all _LZSS chunk types):
   - Sliding window: 4096 bytes, initialized to 0x20 (space), write position starts at 0xFEE
   - Pixel formats:
       PCX_LZSS → 8-bit indexed (1 byte/pixel); header: [uint16 w][uint16 h]
-      TGA_LZSS → 16-bit ARGB1555 (2 bytes/pixel, bit15=alpha); header: [uint16 w][uint16 h]
+      TGA_LZSS → 16-bit BGR4444 (2 bytes/pixel, top nibble unused); header: [uint16 w][uint16 h]
       BMP_LZSS → 16-bit RGB555 (2 bytes/pixel, full background); header: [uint16 w][uint16 h]
       PK0_LZSS → 8-bit indexed sparse RLE sprite; header: [uint16 w][uint16 h][uint32 decompressed_size]
                  After LZSS decompression: row-by-row sparse RLE where each byte is either:
@@ -32,7 +32,7 @@ PCDATA01 chunk types:
   ACTINDEX  (2 bytes):  Animation set count (uint16)
   PALETTE1  (768 bytes): 256-color RGB palette, 3 bytes per entry
   PCX_LZSS  (variable): LZSS-compressed 8-bit indexed sprite
-  TGA_LZSS  (variable): LZSS-compressed 16-bit ARGB1555 sprite
+  TGA_LZSS  (variable): LZSS-compressed 16-bit BGR4444 sprite
   BMP_LZSS  (variable): LZSS-compressed 16-bit RGB555 full background
   PK0_LZSS  (variable): LZSS-compressed sparse RLE 8-bit indexed character sprite
   ACT_DATA  (44 bytes): Animation definition header
@@ -133,24 +133,24 @@ def lzss_decompress(data: bytes, start: int = 4, max_output: int = None) -> byte
 # ─── Image Conversion ─────────────────────────────────────────────────────────
 
 def palette_to_list(palette_data: bytes) -> list:
-    """Convert 768-byte palette to list of (R, G, B) tuples."""
+    """Convert 768-byte palette to list of (R, G, B) tuples.
+
+    Index 0 and index 255 are swapped after loading: the color stored at palette
+    position 255 becomes index 0, and vice versa.
+    """
     colors = []
     for i in range(256):
         r = palette_data[i * 3]
         g = palette_data[i * 3 + 1]
         b = palette_data[i * 3 + 2]
         colors.append((r, g, b))
-    
-    # Swap index 0 and 255 colors
-    if len(colors) == 256:
-        colors[0], colors[255] = colors[255], colors[0]
-        
+    colors[0], colors[255] = colors[255], colors[0]
     return colors
 
 
 def indexed_to_png(pixels: bytes, width: int, height: int,
                    palette: list, out_path: str):
-    """Save 8-bit indexed image as PNG using Pillow."""
+    """Save 8-bit indexed image as PNG using Pillow (mode P, all pixels opaque)."""
     img = _PILImage.new('P', (width, height))
     img.putdata(pixels)
     flat_palette = []
@@ -162,30 +162,27 @@ def indexed_to_png(pixels: bytes, width: int, height: int,
     img.save(out_path)
 
 
-def tga_abgr4444_to_png(pixels: bytes, width: int, height: int, out_path: str):
+def tga_bgr4444_to_png(pixels: bytes, width: int, height: int, out_path: str):
     """
-    Decode TGA_LZSS pixels (ABGR4444) to PNG.
+    Decode TGA_LZSS pixels (BGR4444) to PNG.
 
-    Confirmed from EXE blit inner loop at 0x40f39c:
     Each 16-bit pixel is four 4-bit nibbles:
-      bits 15:12 = Alpha (4-bit, 0 = transparent, 15 = fully opaque)
+      bits 15:12 = unused (was alpha — ignored, all pixels rendered opaque)
       bits 11:8  = Blue  (4-bit)
       bits  7:4  = Green (4-bit)
       bits  3:0  = Red   (4-bit)
 
-    alpha == 0 → fully transparent (PNG alpha = 0).
     Each 4-bit channel scaled to 8-bit: val * 17 (= val * 255 // 15).
+    Output is opaque RGB (no transparency).
     """
-    img = _PILImage.new('RGBA', (width, height))
+    img = _PILImage.new('RGB', (width, height))
     pixel_list = []
     for i in range(0, len(pixels) - 1, 2):
         val = pixels[i] | (pixels[i + 1] << 8)
-        a4 = (val >> 12) & 0xF
         b4 = (val >>  8) & 0xF
         g4 = (val >>  4) & 0xF
         r4 =  val        & 0xF
-        a8 = 0 if a4 == 0 else a4 * 17
-        pixel_list.append((r4 * 17, g4 * 17, b4 * 17, a8))
+        pixel_list.append((r4 * 17, g4 * 17, b4 * 17))
     img.putdata(pixel_list)
     img.save(out_path)
 
@@ -248,11 +245,11 @@ def pk0_decode(rle_data: bytes, width: int, height: int) -> bytes:
 
 def pk0_lzss_to_png(chunk_data: bytes, palette: list, out_path: str):
     """
-    Decode and save a PK0_LZSS chunk as RGBA PNG.
+    Decode and save a PK0_LZSS chunk as RGB PNG (all pixels opaque).
     
     Chunk layout: [uint16 w][uint16 h][uint32 decompressed_size][LZSS compressed data...]
     After LZSS decompression: sparse RLE pixel data (see pk0_decode).
-    Palette index 0 is treated as transparent (alpha=0).
+    Palette index 0 is treated as opaque (shows the actual color at index 0).
     """
     w = struct.unpack_from('<H', chunk_data, 0)[0]
     h = struct.unpack_from('<H', chunk_data, 2)[0]
@@ -261,12 +258,11 @@ def pk0_lzss_to_png(chunk_data: bytes, palette: list, out_path: str):
         return
     rle_data = lzss_decompress(chunk_data, start=8, max_output=decomp_size)
     pixels_indexed = pk0_decode(rle_data, w, h)
-    img = _PILImage.new('RGBA', (w, h))
+    img = _PILImage.new('RGB', (w, h))
     pixel_list = []
     for idx in pixels_indexed:
         r, g, b = palette[idx] if idx < len(palette) else (0, 0, 0)
-        a = 0 if idx == 0 else 255   # index 0 = transparent
-        pixel_list.append((r, g, b, a))
+        pixel_list.append((r, g, b))
     img.putdata(pixel_list)
     img.save(out_path)
 
@@ -519,12 +515,16 @@ def extract_pcdata01(data: bytes, out_dir: str, base_name: str) -> dict:
     # Use first palette as default
     default_palette = palettes[0] if palettes else [(i, i, i) for i in range(256)]
 
-    # Save palettes as .pal files
+    # Save palettes as JASC-PAL files (compatible with Photoshop and Aseprite).
+    # Format: text header, then one "R G B" line per color entry.
     for i, pal in enumerate(palettes):
         pal_path = os.path.join(out_dir, f'{base_name}_palette_{i:02d}.pal')
-        with open(pal_path, 'wb') as f:
+        with open(pal_path, 'w', newline='') as f:
+            f.write('JASC-PAL\r\n')
+            f.write('0100\r\n')
+            f.write(f'{len(pal)}\r\n')
             for r, g, b in pal:
-                f.write(bytes([r, g, b]))
+                f.write(f'{r} {g} {b}\r\n')
 
     # Build global-sprite-index → palette-index map from ACT metadata.
     # TGA/BMP sprites never use this (16-bit), but their global indices are
@@ -573,7 +573,7 @@ def extract_pcdata01(data: bytes, out_dir: str, base_name: str) -> dict:
                 if len(pixels) >= expected:
                     pixels = pixels[:expected]
                 out_path = os.path.join(out_dir, f'{base_name}_tga_{tga_idx:04d}_{w}x{h}.png')
-                tga_abgr4444_to_png(pixels, w, h, out_path)
+                tga_bgr4444_to_png(pixels, w, h, out_path)
                 tga_images.append({
                     'index': tga_idx, 'global_index': global_sprite_idx,
                     'width': w, 'height': h,
