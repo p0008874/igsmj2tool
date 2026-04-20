@@ -1,11 +1,9 @@
 # igsmj2tool
+IGSMJ_patched.bps Used for patching CD check (You need the original IGSMJ.EXE to patch this https://www.marcrobledo.com/RomPatcher.js/) (2001)
 
-igsmj2_extractor.py Sprite and Sound extractor
+igsmj2_extractor.py Sprite and Sound extractor (2002)
 
-Bugs: The extractor can't find multiple palettes.
-
-
-igsmj2_keygen.html Well, the Keygen of course.
+keygen_new.py Well, the Keygen of course. (2002)
 
 
 MJ2013/update.rom (For the 2013 version released in China.)
