@@ -1,5 +1,7 @@
 # igsmj2tool
-IGSMJ_patched.bps Used for patching CD check (You need the original IGSMJ.EXE to patch this https://www.marcrobledo.com/RomPatcher.js/) (2001)
+IGSMJ_noelevate.bps Used for patching CD check (You need the original IGSMJ.EXE to patch this https://www.marcrobledo.com/RomPatcher.js/) (2001)
+
+igsmj2_windowed.bps Used for patching CD check, CRC bypass, and Windowed (You need the original igsmj2.exe to patch this https://www.marcrobledo.com/RomPatcher.js/) (2002)
 
 igsmj2_extractor.py Sprite and Sound extractor (2002)
 
